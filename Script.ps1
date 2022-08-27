@@ -1,5 +1,8 @@
 IPMO AWSPowerShell.NetCore
 $Resources = Get-CFNTypeList -Type Resource -Visibility PUBLIC -Filters_Category AWS_Types | Select TypeName
+$resourcetypejson = $Resources.TypeName | ConvertTo-JSON
+$resourcetypejson | out-file resourcetypes.json -Encoding utf8
+
 $i =1
 mkdir -p ./output
 Foreach ($resource in $Resources){
