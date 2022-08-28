@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Schema API Automation
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: AWS Configuration
+        Parameters:
+          - pS3BucketName
+      - Label:
+          default: Automation Configurations
+        Parameters:
+          - pHoursToRotate
+          - pSnsEmailAddress
+    ParameterLabels:
+      pS3BucketName:
+        default: Repo Config Bucket Name
+      pHoursToRotate:
+        default: Hours To Rotate
+      pSnsEmailAddress:
+        default: SNS Email Address
+
+Parameters:
+
+  pSnsEmailAddress:
+    Type: String
+    Description: Email address for send ssm errors to
+    Default: "grolston@outlook.com"
+
+  pS3BucketName:
+    Type: String
+    Description: S3 Bucket to create store repo access list
+    Default: "cloudformation-schema"
+
+  pHoursToRotate:
+    Type: Number
+    Description: Hours between each key rotation (week=168, month=730, quarter= 2920 )
+    Default: 24
+    MinValue: 1
+    MaxValue: 2190
+
+
+Resources:
+
+  rSnsTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W47
+            reason: "KMS to be implemented in later version"
+    Properties:
+      #checkov:skip=CKV_AWS_26: "Ensure all data stored in the SNS topic is encrypted"
+      Subscription:
+        - Endpoint: !Ref pSnsEmailAddress
+          Protocol: email
+
+  rSsmRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "TODO limit policy for logs"
+          - id: W28
+            reason: "Name of role helps identify or associate it to solution"
+    Properties:
+      RoleName: "SSM-CloudFormation-Schema"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SSMCloudFormationSchema
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:DeleteObject'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 'cloudformation:*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${pS3BucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${pS3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:*'
+                Resource: '*'
+              - Effect: 'Deny'
+                Action:
+                  - 's3:DeleteBucket'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${pS3BucketName}'
+              - Effect: "Allow"
+                Action:
+                  - 'sns:Publish'
+                Resource:  !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${rSnsTopic.TopicName}"
+              - Effect: "Allow"
+                Action:
+                  - 'logs:*'
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ssm/automation//executeScript:*"
+
+  rSsmAutomation:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: "Sync-CloudFormation-Schema"
+      Content:
+        description: "Sync CloudFormation Schema CLI to S3 Bucket"
+        schemaVersion: '0.3'
+        assumeRole: !GetAtt rSsmRole.Arn
+        parameters:
+          S3BUCKET:
+            description: "S3 Bucket to create store repo access list"
+            type: "String"
+            default: !Ref pS3BucketName
+          REGION:
+            description: "AWS region to run commands in"
+            type: "String"
+            default: !Sub "${AWS::Region}"
+          SNSTOPIC:
+            description: SNS Topic to send errors to.
+            type: "String"
+            default: !Ref rSnsTopic
+        mainSteps:
+          - name: ExecuteCode
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: PowerShell Core 6.0
+              InputPayload:
+                S3BUCKET: "{{ S3BUCKET }}"
+                AWS_REGION: "{{ REGION }}"
+                SNS_TOPIC: "{{ SNSTOPIC }}"
+              Script: |-
+                $ErrorActionPreference = 'Stop'
+                Install-Module -Name AWS.Tools.CloudFormation -Force;
+                Import-Module AWS.Tools.CloudFormation;
+                Install-Module AWS.Tools.S3 -Force;
+                Import-Module AWS.Tools.S3;
+                Install-Module AWS.Tools.SimpleNotificationService -Force;
+                Import-Module AWS.Tools.SimpleNotificationService;
+
+                $payload = $env:InputPayload | ConvertFrom-Json;
+                $S3BUCKET= $payload.S3BUCKET
+                $SNS_TOPIC = $payload.SNS_TOPIC
+                $REGION = $payload.AWS_REGION
+
+
+                $Resources = Get-CFNTypeList -Type Resource -Visibility PUBLIC -Filters_Category AWS_Types | Select-Object TypeName
+                $resourcetypejson = $Resources.TypeName | ConvertTo-JSON
+                $s3BucketKeyResourceTypes = 'resourcetypelist.json'
+
+                ## Attempt to upload resource type list
+                ## this is the raw resource type name that includes ::
+                try{
+                  Write-S3Object -BucketName $S3BUCKET -Key $s3BucketKeyResourceTypes -Content $resourcetypejson -ErrorAction "Stop"
+                }
+                catch {
+                  $Message = "Failed to WRITE to S3 Bucket $S3BUCKET with key $s3BucketKeyResourceTypes."
+                  Write-Host $Message
+                  #Publish-SNSMessage -TopicArn $SNS_TOPIC -Message $Message
+                  Write-Error -Message $_ -ErrorAction "Stop"
+                }
+
+                ## obj will contain the generated list of URL friendly resourcetype links for reference
+                $resourceTypeLinkObj = @()
+                $i =1
+                $failedUpload = 0
+                $successfulUpload = 0
+                Foreach ($resource in $Resources){
+                  $resourceName = $resource.TypeName
+                  $fileName = $resourceName.replace('::', '-')
+                  $s3BucketKeyResourceName = "$filename.json"
+                  $resourceTypeLinkObj += $s3BucketKeyResourceName
+                  $JsonObj = $(Get-CFNType -TypeName $resourceName -Type Resource).Schema
+
+                  try{
+                    Write-S3Object -BucketName $S3BUCKET -Key "resourcetype/$s3BucketKeyResourceName" -Content $JsonObj -ErrorAction "Stop"
+                    $successfulUpload++
+                  }
+                  catch {
+                    $failedUpload++
+                    $Message = "Failed to WRITE to S3 Bucket $S3BUCKET with key $s3BucketKeyResourceName."
+                    Write-Host $Message
+                    #Publish-SNSMessage -TopicArn $SNS_TOPIC -Message $Message
+                    Write-Error -Message $_ -ErrorAction "Stop"
+                  }
+                  Write-Host "completed $i of $($resources.count)…"
+                  if($i % 10  -eq 0) {write-host "throttling 2 seconds"; sleep 2}
+                  $i++
+                }
+
+                $resourceTypeLinksJson = $resourceTypeLinkObj | ConvertTo-Json
+                $s3BucketKeyResourceTypeLink = 'resourcetype.json'
+
+                ## Attempt to upload resource type links
+                ## this is an updated list replace :: with - to make it url friendly.
+                ## use this list to find the text files located in /resourcetype/ directory
+                try{
+                  Write-S3Object -BucketName $S3BUCKET -Key $s3BucketKeyResourceTypeLink -Content $resourceTypeLinksJson  -ErrorAction "Stop"
+                }
+                catch {
+                  $Message = "Failed to WRITE to S3 Bucket $REPO_BUCKET with key $s3BucketKeyResourceTypes."
+                  Write-Host $Message
+                  #Publish-SNSMessage -TopicArn $SNS_TOPIC -Message $Message
+                  Write-Error -Message $_ -ErrorAction "Stop"
+                }
+
+                Write-Host "Sync complete. Total Items: $i  | Successful uploads: $successfulUpload | Failed Uploads: $failedUpload"
+
+  rEventsRuleRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Role name given to help associate solution with resource"
+    Properties:
+      RoleName: "SSM-Schema-Sync-EventExec"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - events.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: "StartSSM"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:StartAutomationExecution"
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${rSsmAutomation}:*"
+
+  rEventsRuleRotate:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "Sync-CloudFormation-Schema"
+      Description: "Event to trigger Sync CloudFormation Schema Automation document."
+      ScheduleExpression: !Sub "rate(${pHoursToRotate} hours)"
+      RoleArn: !GetAtt  rEventsRuleRole.Arn
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${rSsmAutomation}:$DEFAULT
+          Id: "Sync-CloudFormation-Schema"
+          Input: !Sub '{"S3BUCKET":["${pS3BucketName}"]}'
+          RoleArn: !GetAtt  rEventsRuleRole.Arn
